@@ -126,6 +126,52 @@ function isConnectFailure(error: unknown): boolean {
   return ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT", "CERT_HAS_EXPIRED"].includes(code ?? "");
 }
 
+// newapi muse-spark 通道只放行流式请求: stream:true 回来的是 SSE,
+// 这里拼回 chat-completion 形状, 下游解析/usage 逻辑零改动.
+function isSseStream(res: Response, text: string): boolean {
+  const ct = res.headers.get("content-type") ?? "";
+  if (ct.includes("text/event-stream")) return true;
+  const t = text.trimStart();
+  return t.startsWith("data:") && (text.includes("chat.completion.chunk") || text.includes("[DONE]"));
+}
+
+function parseChatCompletionsSse(text: string): Record<string, unknown> {
+  let id: string | undefined;
+  let model: string | undefined;
+  let created = Math.floor(Date.now() / 1000);
+  let finishReason: string | null = null;
+  let usage: Record<string, unknown> | null = null;
+  const parts: string[] = [];
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("data:")) continue;
+    const payload = t.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    let chunk: Record<string, unknown>;
+    try {
+      chunk = JSON.parse(payload) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (typeof chunk.id === "string") id = chunk.id;
+    if (typeof chunk.model === "string") model = chunk.model;
+    if (typeof chunk.created === "number") created = chunk.created;
+    const choices = chunk.choices as Array<Record<string, unknown>> | undefined;
+    const delta = choices?.[0]?.delta as Record<string, unknown> | undefined;
+    if (typeof delta?.content === "string") parts.push(delta.content);
+    if (typeof choices?.[0]?.finish_reason === "string") finishReason = choices[0].finish_reason as string;
+    if (chunk.usage && typeof chunk.usage === "object") usage = chunk.usage as Record<string, unknown>;
+  }
+  return {
+    id,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [{ index: 0, message: { role: "assistant", content: parts.join("") }, finish_reason: finishReason ?? "stop" }],
+    ...(usage ? { usage } : {}),
+  };
+}
+
 export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): Promise<ChatJsonResult<z.infer<S>>> {
   const spec = MODELS[opts.model];
   if (!spec) throw new Error(`Unknown model ${opts.model}`);
@@ -149,6 +195,8 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
     max_tokens: maxTokens,
     ...(spec.jsonMode && opts.json !== false ? { response_format: { type: "json_object" } } : {}),
     ...(spec.extra ?? {}),
+    // newapi muse-spark 通道只放行流式请求(非流式→403 FreeTierError); 下方把 SSE 拼回 chat-completion 对象.
+    stream: true,
   };
 
   const receipt = await paidRequest(
@@ -178,11 +226,15 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
       const text = await res.text();
       assertAccepted(spec.service, res.status, text);
       let json: Record<string, unknown>;
-      try {
-        json = JSON.parse(text);
-        if (!json || typeof json !== "object" || Array.isArray(json)) throw new Error("Expected a response object");
-      } catch {
-        json = { unparsable: text.slice(0, 20000) };
+      if (isSseStream(res, text)) {
+        json = parseChatCompletionsSse(text);
+      } else {
+        try {
+          json = JSON.parse(text);
+          if (!json || typeof json !== "object" || Array.isArray(json)) throw new Error("Expected a response object");
+        } catch {
+          json = { unparsable: text.slice(0, 20000) };
+        }
       }
       const usage = (json.usage as Record<string, unknown> | undefined) ?? null;
       return {
